@@ -2,9 +2,12 @@
 
 This module implements the MCP server using FastMCP, exposing the query
 functionality as an MCP tool. It includes complete lifespan management for
-initializing and cleaning up all components.
+initializing and cleaning up all components, with per-database pools,
+validators (merging per-database security overrides), and executors resolved
+from the configured database registry.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -13,12 +16,13 @@ from asyncpg import Pool
 from mcp.server.fastmcp import FastMCP
 
 from pg_mcp.cache.schema_cache import SchemaCache
+from pg_mcp.config.databases import resolve_database_entries
 from pg_mcp.config.settings import Settings
 from pg_mcp.db.pool import close_pools, create_pool
-from pg_mcp.models.query import QueryRequest, QueryResponse, ReturnType
+from pg_mcp.models.errors import ErrorCode
+from pg_mcp.models.query import QueryRequest, ReturnType
 from pg_mcp.observability.logging import configure_logging, get_logger
 from pg_mcp.observability.metrics import MetricsCollector
-from pg_mcp.resilience.circuit_breaker import CircuitBreaker
 from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.orchestrator import QueryOrchestrator
 from pg_mcp.services.result_validator import ResultValidator
@@ -28,18 +32,44 @@ from pg_mcp.services.sql_validator import SQLValidator
 
 logger = get_logger(__name__)
 
-# Global state for lifespan management
+# Global state for lifespan management. The circuit breaker lives inside the
+# orchestrator (one per LLM dependency); only wiring-level state is here.
 _settings: Settings | None = None
 _pools: dict[str, Pool] | None = None
 _schema_cache: SchemaCache | None = None
 _orchestrator: QueryOrchestrator | None = None
 _metrics: MetricsCollector | None = None
-_circuit_breaker: CircuitBreaker | None = None
 _rate_limiter: MultiRateLimiter | None = None
 
 
+def _error_envelope(
+    code: ErrorCode,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a compact failure envelope matching QueryResponse.to_dict shape.
+
+    Args:
+        code: Error code from the ErrorCode enum.
+        message: Human-readable error message.
+        details: Optional error context (omitted when None).
+
+    Returns:
+        dict: Failure envelope with success/error/confidence/tokens_used keys.
+    """
+    error: dict[str, Any] = {"code": code.value, "message": message}
+    if details is not None:
+        error["details"] = details
+    return {
+        "success": False,
+        "error": error,
+        "confidence": 0,
+        "tokens_used": 0,
+    }
+
+
 @asynccontextmanager
-async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-arg]
+async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
     """Lifespan context manager for server initialization and cleanup.
 
     This function manages the complete lifecycle of the MCP server:
@@ -47,29 +77,21 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
     Startup:
         1. Load configuration from Settings
         2. Configure logging
-        3. Create database connection pools
-        4. Load schema cache for all databases
-        5. Initialize metrics collector
-        6. Create service components (generators, validators, executors)
-        7. Initialize resilience components (circuit breaker, rate limiter)
-        8. Create query orchestrator
-        9. Start metrics HTTP server (optional)
+        3. Resolve the database registry (databases.json or DATABASE_* fallback)
+        4. Create one connection pool, validator, and executor per database
+        5. Load schema cache for all databases
+        6. Initialize metrics collector (and optional HTTP server)
+        7. Create service components and resilience components
+        8. Create query orchestrator wired for per-database routing
 
     Shutdown:
         1. Stop schema auto-refresh (if enabled)
         2. Close all database connection pools
-        3. Stop metrics HTTP server (if running)
 
     Yields:
         None
-
-    Example:
-        >>> async with lifespan():
-        ...     # Server is running with all components initialized
-        ...     pass
     """
-    global _settings, _pools, _schema_cache, _orchestrator, _metrics
-    global _circuit_breaker, _rate_limiter
+    global _settings, _pools, _schema_cache, _orchestrator, _metrics, _rate_limiter
 
     logger.info("Starting PostgreSQL MCP Server initialization...")
 
@@ -94,119 +116,125 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             },
         )
 
-        # 3. Create database connection pools
-        logger.info("Creating database connection pools...")
-        _pools = {}
-        # Note: For single database configuration, we use the main database config
-        pool = await create_pool(_settings.database)
-        _pools[_settings.database.name] = pool
+        # 3. Resolve database registry (JSON file preferred, env fallback)
+        registry = resolve_database_entries(_settings)
         logger.info(
-            f"Created connection pool for database '{_settings.database.name}'",
+            "Database registry resolved",
             extra={
-                "min_size": _settings.database.min_pool_size,
-                "max_size": _settings.database.max_pool_size,
+                "databases": registry.names,
+                "default_database": registry.default_database,
             },
         )
 
-        # 4. Load Schema cache
+        # 4. Create per-database pools, validators, and executors
+        logger.info("Creating database connection pools...")
+        _pools = {}
+        sql_validators: dict[str, SQLValidator] = {}
+        sql_executors: dict[str, SQLExecutor] = {}
+
+        for name, entry in registry.entries.items():
+            db_config = entry.to_database_config()
+            pool = await create_pool(db_config)
+            _pools[name] = pool
+            logger.info(
+                f"Created connection pool for database '{name}'",
+                extra={
+                    "database": name,
+                    "dsn": entry.safe_dsn,
+                    "min_size": entry.pool.min_size,
+                    "max_size": entry.pool.max_size,
+                },
+            )
+
+            # Per-database security: unset overrides inherit the SECURITY_*
+            # global defaults resolved into settings.security.
+            overrides = entry.security
+            sql_validators[name] = SQLValidator(
+                config=_settings.security,
+                blocked_tables=(
+                    overrides.blocked_tables
+                    if overrides.blocked_tables is not None
+                    else _settings.security.blocked_tables
+                ),
+                blocked_columns=(
+                    overrides.blocked_columns
+                    if overrides.blocked_columns is not None
+                    else _settings.security.blocked_columns
+                ),
+                allow_explain=(
+                    overrides.allow_explain
+                    if overrides.allow_explain is not None
+                    else _settings.security.allow_explain
+                ),
+            )
+
+            sql_executors[name] = SQLExecutor(
+                pool=pool,
+                security_config=_settings.security,
+                db_config=db_config,
+            )
+            logger.info(f"Created validator and executor for database '{name}'")
+
+        # 5. Load Schema cache for every configured database
         logger.info("Initializing schema cache...")
         _schema_cache = SchemaCache(_settings.cache)
 
-        for db_name, pool in _pools.items():
+        for db_name, pool in (_pools or {}).items():
             logger.info(f"Loading schema for database '{db_name}'...")
             schema = await _schema_cache.load(db_name, pool)
             logger.info(
                 f"Schema loaded for '{db_name}'",
-                extra={
-                    "tables": len(schema.tables),
-                },
+                extra={"database": db_name, "tables": len(schema.tables)},
             )
 
-        # Optional: Start schema auto-refresh
-        # Disabled by default to avoid unnecessary background tasks
-        # Uncomment to enable:
-        # if _settings.cache.enabled:
-        #     logger.info("Starting schema auto-refresh...")
-        #     await _schema_cache.start_auto_refresh(
-        #         interval_minutes=60,  # Refresh every hour
-        #         pools=_pools,
-        #     )
-
-        # 5. Initialize metrics collector
+        # 6. Initialize metrics collector
         logger.info("Initializing metrics collector...")
         _metrics = MetricsCollector()
 
-        # Start metrics HTTP server if enabled
         if _settings.observability.metrics_enabled:
-            from prometheus_client import start_http_server
+            _metrics.start_metrics_server(_settings.observability.metrics_port)
+            logger.info(
+                f"Metrics server started on port {_settings.observability.metrics_port}"
+            )
 
-            start_http_server(_settings.observability.metrics_port)
-            logger.info(f"Metrics server started on port {_settings.observability.metrics_port}")
-
-        # 6. Create service components
+        # 7. Create service components
         logger.info("Initializing service components...")
 
-        # SQL Generator
         sql_generator = SQLGenerator(_settings.openai)
 
-        # SQL Validator
-        sql_validator = SQLValidator(
-            config=_settings.security,
-            blocked_tables=None,  # Can be configured via settings if needed
-            blocked_columns=None,  # Can be configured via settings if needed
-            allow_explain=False,
-        )
-
-        # SQL Executor (create one per database)
-        sql_executors: dict[str, SQLExecutor] = {}
-        for db_name, pool in _pools.items():
-            executor = SQLExecutor(
-                pool=pool,
-                security_config=_settings.security,
-                db_config=_settings.database,
-            )
-            sql_executors[db_name] = executor
-            logger.info(f"Created SQL executor for database '{db_name}'")
-
-        # Result Validator
         result_validator = ResultValidator(
             openai_config=_settings.openai,
             validation_config=_settings.validation,
         )
 
-        # 7. Initialize resilience components
-        logger.info("Initializing resilience components...")
-
-        # Circuit Breaker for LLM calls
-        _circuit_breaker = CircuitBreaker(
-            failure_threshold=_settings.resilience.circuit_breaker_threshold,
-            recovery_timeout=_settings.resilience.circuit_breaker_timeout,
-        )
-
-        # Rate Limiter
+        # Resilience: concurrency limiters from configuration
         _rate_limiter = MultiRateLimiter(
-            query_limit=10,  # Can be made configurable
-            llm_limit=5,  # Can be made configurable
+            query_limit=_settings.resilience.query_concurrency,
+            llm_limit=_settings.resilience.llm_concurrency,
         )
 
-        # 8. Create QueryOrchestrator
+        # 8. Create QueryOrchestrator wired for per-database routing
         logger.info("Creating query orchestrator...")
         _orchestrator = QueryOrchestrator(
             sql_generator=sql_generator,
-            sql_validator=sql_validator,
-            sql_executor=sql_executors[_settings.database.name],  # Use primary executor
+            sql_validators=sql_validators,
+            sql_executors=sql_executors,
             result_validator=result_validator,
             schema_cache=_schema_cache,
             pools=_pools,
             resilience_config=_settings.resilience,
             validation_config=_settings.validation,
+            default_database=registry.default_database,
+            metrics=_metrics,
+            rate_limiter=_rate_limiter,
         )
 
         logger.info("PostgreSQL MCP Server initialization complete!")
         logger.info(
             "Server ready to accept requests",
             extra={
-                "databases": list(_pools.keys()),
+                "databases": registry.names,
+                "default_database": registry.default_database,
                 "cache_enabled": _settings.cache.enabled,
                 "metrics_enabled": _settings.observability.metrics_enabled,
             },
@@ -222,22 +250,17 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # Stop schema auto-refresh with timeout
         if _schema_cache is not None:
             try:
-                import asyncio
-                await asyncio.wait_for(
-                    _schema_cache.stop_auto_refresh(),
-                    timeout=3.0
-                )
+                await asyncio.wait_for(_schema_cache.stop_auto_refresh(), timeout=3.0)
                 logger.info("Schema auto-refresh stopped")
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Schema auto-refresh stop timed out")
             except Exception as e:
                 logger.warning(f"Error stopping schema auto-refresh: {e!s}")
 
-        # Close database connection pools with timeout
+        # Close database connection pools gracefully
         if _pools is not None:
             try:
-                # Use 5 second timeout for graceful shutdown
-                await close_pools(_pools, timeout=5.0)
+                await close_pools(_pools)
                 logger.info("Database connection pools closed")
             except Exception as e:
                 logger.error(f"Error closing connection pools: {e!s}")
@@ -268,9 +291,8 @@ async def query(
                 - "Show me the top 10 products by revenue"
                 - "What is the average order value by country?"
 
-        database: Target database name (optional if only one database is configured).
-            If not specified and only one database is available, it will be
-            automatically selected.
+        database: Target database name (optional when a default database is
+            configured or only one database is available).
 
         return_type: Type of result to return.
             Options:
@@ -285,55 +307,30 @@ async def query(
             - error (dict): Error information if query failed
             - confidence (int): Confidence score (0-100) for result quality
             - tokens_used (int): Number of LLM tokens consumed
-
-    Examples:
-        >>> # Get query results
-        >>> result = await query(
-        ...     question="How many active users are there?",
-        ...     return_type="result"
-        ... )
-        >>> print(result["data"]["rows"])
-
-        >>> # Get SQL only
-        >>> result = await query(
-        ...     question="Count all products",
-        ...     return_type="sql"
-        ... )
-        >>> print(result["generated_sql"])
-
-    Raises:
-        This function does not raise exceptions. All errors are captured and
-        returned in the response with success=False and error details.
+            - request_id (str): Identifier for tracing this request in logs
 
     Security:
         - Only SELECT queries are allowed (no INSERT, UPDATE, DELETE, DROP, etc.)
         - Dangerous PostgreSQL functions are blocked (pg_sleep, file operations, etc.)
+        - Per-database blocked tables/columns are enforced during validation
         - Query execution timeout is enforced
         - Row count limits prevent memory exhaustion
         - All queries run in read-only transactions
+        - Concurrent queries are bounded by the configured concurrency limiter
     """
-    global _orchestrator
-
     if _orchestrator is None:
-        return {
-            "success": False,
-            "error": {
-                "code": "SERVER_NOT_INITIALIZED",
-                "message": "Server not initialized properly",
-                "details": None,
-            },
-        }
+        return _error_envelope(
+            ErrorCode.SERVER_NOT_INITIALIZED,
+            "Server not initialized properly",
+        )
 
     # Validate return_type
     if return_type not in ("sql", "result"):
-        return {
-            "success": False,
-            "error": {
-                "code": "INVALID_PARAMETER",
-                "message": f"Invalid return_type: '{return_type}'. Must be 'sql' or 'result'.",
-                "details": {"return_type": return_type},
-            },
-        }
+        return _error_envelope(
+            ErrorCode.INVALID_PARAMETER,
+            f"Invalid return_type: '{return_type}'. Must be 'sql' or 'result'.",
+            details={"return_type": return_type},
+        )
 
     # Build request
     try:
@@ -343,34 +340,49 @@ async def query(
             return_type=ReturnType(return_type),
         )
     except Exception as e:
-        return {
-            "success": False,
-            "error": {
-                "code": "INVALID_REQUEST",
-                "message": f"Invalid request parameters: {e!s}",
-                "details": {"error": str(e)},
-            },
-        }
+        return _error_envelope(
+            ErrorCode.INVALID_REQUEST,
+            f"Invalid request parameters: {e!s}",
+            details={"error": str(e)},
+        )
 
-    # Execute query through orchestrator
+    # Execute query through orchestrator, bounded by the query concurrency
+    # limiter. A timeout while waiting for a slot is reported as
+    # rate_limit_exceeded rather than queuing indefinitely.
+    limiter = _rate_limiter
     try:
-        response: QueryResponse = await _orchestrator.execute_query(request)
-        result = response.to_dict()
-        # Ensure tokens_used is always present
-        if "tokens_used" not in result:
-            result["tokens_used"] = 0
-        return result
+        if limiter is not None:
+            async with limiter.for_queries(timeout=_rate_limit_timeout()):
+                response = await _orchestrator.execute_query(request)
+        else:
+            response = await _orchestrator.execute_query(request)
+    except TimeoutError:
+        logger.warning("Query rejected: concurrency limiter wait timed out")
+        return _error_envelope(
+            ErrorCode.RATE_LIMIT_EXCEEDED,
+            "Too many concurrent queries; timed out waiting for a slot",
+            details={"timeout_seconds": _rate_limit_timeout()},
+        )
     except Exception as e:
         logger.exception("Unexpected error in query tool")
-        return {
-            "success": False,
-            "error": {
-                "code": "INTERNAL_ERROR",
-                "message": f"Internal server error: {e!s}",
-                "details": {"error_type": type(e).__name__},
-            },
-            "tokens_used": 0,
-        }
+        return _error_envelope(
+            ErrorCode.INTERNAL_ERROR,
+            f"Internal server error: {e!s}",
+            details={"error_type": type(e).__name__},
+        )
+
+    return response.to_dict()
+
+
+def _rate_limit_timeout() -> float:
+    """Get the concurrency limiter wait timeout from settings.
+
+    Returns:
+        float: Timeout in seconds (0 means fail fast when no slot is free).
+    """
+    if _settings is None:
+        return 0.0
+    return _settings.resilience.rate_limit_timeout
 
 
 if __name__ == "__main__":

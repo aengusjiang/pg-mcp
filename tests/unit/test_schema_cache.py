@@ -356,3 +356,86 @@ class TestSchemaCache:
             await cache.stop_auto_refresh()
 
             assert cache._stop_refresh is True
+
+
+class TestLRUEviction:
+    """Tests for max_size LRU eviction in SchemaCache."""
+
+    @pytest.fixture
+    def small_cache(self) -> SchemaCache:
+        """Create a cache limited to two entries."""
+        return SchemaCache(CacheConfig(schema_ttl=3600, max_size=2, enabled=True))
+
+    @pytest.fixture
+    def mock_pool(self) -> Mock:
+        """Create mock connection pool."""
+        return MagicMock()
+
+    @pytest.fixture
+    def sample_schema(self) -> DatabaseSchema:
+        """Create sample database schema for testing."""
+        return DatabaseSchema(
+            database_name="test_db",
+            tables=[
+                TableInfo(
+                    schema_name="public",
+                    table_name="users",
+                    columns=[],
+                )
+            ],
+            enum_types=[],
+            version="PostgreSQL 16.0",
+        )
+
+    def _patch_introspector(self, sample_schema: DatabaseSchema) -> patch:
+        """Patch SchemaIntrospector to return the sample schema."""
+        return patch(
+            "pg_mcp.cache.schema_cache.SchemaIntrospector",
+            return_value=Mock(introspect=AsyncMock(return_value=sample_schema)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_load_beyond_max_size_evicts_oldest(
+        self, small_cache: SchemaCache, mock_pool: Mock, sample_schema: DatabaseSchema
+    ):
+        """Loading a third entry evicts the least recently used entry."""
+        with self._patch_introspector(sample_schema):
+            await small_cache.load("db1", mock_pool)
+            await small_cache.load("db2", mock_pool)
+            await small_cache.load("db3", mock_pool)
+
+        assert small_cache.get_cached_databases() == ["db2", "db3"]
+        assert small_cache.get_cache_age("db1") is None
+
+    @pytest.mark.asyncio
+    async def test_get_refreshes_recency(
+        self, small_cache: SchemaCache, mock_pool: Mock, sample_schema: DatabaseSchema
+    ):
+        """A get() lookup protects an entry from eviction."""
+        with self._patch_introspector(sample_schema):
+            await small_cache.load("db1", mock_pool)
+            await small_cache.load("db2", mock_pool)
+
+        # Touch db1 so db2 becomes the least recently used entry
+        assert small_cache.get("db1") is not None
+
+        with self._patch_introspector(sample_schema):
+            await small_cache.load("db3", mock_pool)
+
+        assert small_cache.get_cached_databases() == ["db1", "db3"]
+        assert small_cache.get("db2") is None
+
+    @pytest.mark.asyncio
+    async def test_reload_updates_recency(
+        self, small_cache: SchemaCache, mock_pool: Mock, sample_schema: DatabaseSchema
+    ):
+        """Re-loading an existing entry moves it to most recently used."""
+        with self._patch_introspector(sample_schema):
+            await small_cache.load("db1", mock_pool)
+            await small_cache.load("db2", mock_pool)
+            await small_cache.load("db1", mock_pool)
+            await small_cache.load("db3", mock_pool)
+
+        # db1 was reloaded most recently, so db2 is the entry evicted
+        assert small_cache.get_cached_databases() == ["db1", "db3"]
+        assert small_cache.get("db2") is None

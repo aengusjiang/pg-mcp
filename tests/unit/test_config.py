@@ -134,6 +134,37 @@ class TestOpenAIConfig:
         with pytest.raises(ValidationError, match="must start with 'sk-'"):
             OpenAIConfig(api_key="invalid-key")
 
+    def test_base_url_allows_gateway_key_format(self) -> None:
+        """A custom base_url lifts the 'sk-' prefix requirement."""
+        config = OpenAIConfig(
+            api_key="e07119c.gw-style-key",
+            base_url="https://open.bigmodel.cn/api/paas/v4",
+        )
+        assert config.base_url == "https://open.bigmodel.cn/api/paas/v4"
+        assert config.api_key.get_secret_value() == "e07119c.gw-style-key"
+
+    def test_base_url_with_empty_key_still_rejected(self) -> None:
+        """base_url does not waive the non-empty key requirement."""
+        with pytest.raises(ValidationError, match="must not be empty"):
+            OpenAIConfig(api_key="", base_url="https://gw.example.com/v4")
+
+    def test_base_url_with_invalid_scheme_rejected(self) -> None:
+        """base_url must be an http(s) URL."""
+        with pytest.raises(ValidationError, match="http://' or 'https://'"):
+            OpenAIConfig(api_key="gw-key", base_url="ftp://gw.example.com/v4")
+
+    def test_base_url_defaults_to_none(self) -> None:
+        """Without a gateway the key must keep the official sk- format."""
+        config = OpenAIConfig(api_key="sk-test123")
+        assert config.base_url is None
+
+    def test_base_url_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OPENAI_BASE_URL env var is picked up like other settings."""
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://gw.example.com/v4")
+        monkeypatch.setenv("OPENAI_API_KEY", "gw-key")
+        config = OpenAIConfig()
+        assert config.base_url == "https://gw.example.com/v4"
+
     def test_invalid_max_tokens(self) -> None:
         """Test invalid max_tokens is rejected."""
         with pytest.raises(ValidationError):
@@ -157,11 +188,13 @@ class TestSecurityConfig:
     def test_default_values(self) -> None:
         """Test default configuration values."""
         config = SecurityConfig()
-        assert config.allow_write_operations is False
         assert config.max_rows == 10000
         assert config.max_execution_time == 30.0
         assert "pg_sleep" in config.blocked_functions
         assert "pg_read_file" in config.blocked_functions
+        assert config.blocked_tables == []
+        assert config.blocked_columns == []
+        assert config.allow_explain is False
 
     def test_custom_blocked_functions(self) -> None:
         """Test custom blocked functions."""
@@ -179,10 +212,24 @@ class TestSecurityConfig:
         assert "func2" in config.blocked_functions
         assert "func3" in config.blocked_functions
 
-    def test_allow_write_operations(self) -> None:
-        """Test enabling write operations."""
-        config = SecurityConfig(allow_write_operations=True)
-        assert config.allow_write_operations is True
+    def test_blocked_tables_and_columns_from_string(self) -> None:
+        """Test parsing blocked tables/columns from comma-separated strings."""
+        config = SecurityConfig(
+            blocked_tables="audit_log, secrets",  # type: ignore
+            blocked_columns="users.email, tokens.value",  # type: ignore
+        )
+        assert config.blocked_tables == ["audit_log", "secrets"]
+        assert config.blocked_columns == ["users.email", "tokens.value"]
+
+    def test_allow_explain_flag(self) -> None:
+        """Test enabling the EXPLAIN policy."""
+        config = SecurityConfig(allow_explain=True)
+        assert config.allow_explain is True
+
+    def test_stale_env_vars_are_ignored(self) -> None:
+        """Test that removed settings (e.g. allow_write_operations) don't break."""
+        config = SecurityConfig(allow_write_operations=True)  # type: ignore[call-arg]
+        assert not hasattr(config, "allow_write_operations")
 
     def test_invalid_max_rows(self) -> None:
         """Test invalid max_rows is rejected."""
@@ -199,25 +246,31 @@ class TestValidationConfig:
     def test_default_values(self) -> None:
         """Test default configuration values."""
         config = ValidationConfig()
-        assert config.max_question_length == 10000
-        assert config.min_confidence_score == 70
+        assert config.enabled is True
+        assert config.sample_rows == 5
+        assert config.timeout_seconds == 10.0
+        assert config.confidence_threshold == 70
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
         config = ValidationConfig(
-            max_question_length=5000,
-            min_confidence_score=80,
+            enabled=False,
+            sample_rows=10,
+            timeout_seconds=20.0,
+            confidence_threshold=85,
         )
-        assert config.max_question_length == 5000
-        assert config.min_confidence_score == 80
+        assert config.enabled is False
+        assert config.sample_rows == 10
+        assert config.timeout_seconds == 20.0
+        assert config.confidence_threshold == 85
 
-    def test_invalid_confidence_score(self) -> None:
-        """Test invalid confidence score is rejected."""
+    def test_invalid_sample_rows(self) -> None:
+        """Test invalid sample rows is rejected."""
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=-1)
+            ValidationConfig(sample_rows=0)
 
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=101)
+            ValidationConfig(sample_rows=101)
 
 
 class TestCacheConfig:
@@ -261,6 +314,28 @@ class TestResilienceConfig:
         assert config.backoff_factor == 2.0
         assert config.circuit_breaker_threshold == 5
         assert config.circuit_breaker_timeout == 60.0
+        assert config.query_concurrency == 10
+        assert config.llm_concurrency == 5
+        assert config.rate_limit_timeout == 30.0
+
+    def test_concurrency_limits(self) -> None:
+        """Test custom concurrency limits."""
+        config = ResilienceConfig(
+            query_concurrency=50,
+            llm_concurrency=20,
+            rate_limit_timeout=60.0,
+        )
+        assert config.query_concurrency == 50
+        assert config.llm_concurrency == 20
+        assert config.rate_limit_timeout == 60.0
+
+    def test_invalid_concurrency(self) -> None:
+        """Test invalid concurrency is rejected."""
+        with pytest.raises(ValidationError):
+            ResilienceConfig(query_concurrency=0)
+
+        with pytest.raises(ValidationError):
+            ResilienceConfig(llm_concurrency=-1)
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
@@ -333,23 +408,10 @@ class TestSettings:
         assert settings.resilience is not None
         assert settings.observability is not None
 
-    def test_is_production(self) -> None:
-        """Test production environment check."""
-        settings = Settings(
-            environment="production",
-            openai=OpenAIConfig(api_key="sk-test"),
-        )
-        assert settings.is_production
-        assert not settings.is_development
-
-    def test_is_development(self) -> None:
-        """Test development environment check."""
-        settings = Settings(
-            environment="development",
-            openai=OpenAIConfig(api_key="sk-test"),
-        )
-        assert settings.is_development
-        assert not settings.is_production
+    def test_databases_file_default(self) -> None:
+        """Test databases_file defaults to None (single-database mode)."""
+        settings = Settings(openai=OpenAIConfig(api_key="sk-test"))
+        assert settings.databases_file is None
 
     def test_nested_config_override(self) -> None:
         """Test overriding nested configurations."""
@@ -360,12 +422,12 @@ class TestSettings:
                 port=5433,
             ),
             security=SecurityConfig(
-                allow_write_operations=True,
+                blocked_tables=["audit_log"],
             ),
         )
         assert settings.database.host == "custom.host"
         assert settings.database.port == 5433
-        assert settings.security.allow_write_operations is True
+        assert settings.security.blocked_tables == ["audit_log"]
 
 
 class TestSettingsGlobalInstance:
@@ -420,3 +482,63 @@ class TestSettingsGlobalInstance:
         assert settings.openai.model == "gpt-4"
         assert settings.database.host == "env.host.com"
         assert settings.security.max_rows == 5000
+
+
+class TestDotEnvPropagation:
+    """Tests that nested config sections read the .env file.
+
+    Regression guard: pydantic-settings does not propagate the parent's
+    env_file, so every nested section must declare it explicitly. Before
+    this fix, a plain .env file was silently ignored for DATABASE_*/,
+    /*SECURITY_, ... variables.
+    """
+
+    def test_database_config_reads_dotenv(self, tmp_path, monkeypatch) -> None:
+        """Nested DatabaseConfig picks up DATABASE_* from a .env file."""
+        (tmp_path / ".env").write_text(
+            "DATABASE_HOST=dotenv.host\nDATABASE_NAME=blog_small\n", encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
+        config = DatabaseConfig()
+        assert config.host == "dotenv.host"
+        assert config.name == "blog_small"
+
+    def test_security_config_reads_dotenv(self, tmp_path, monkeypatch) -> None:
+        """Nested SecurityConfig picks up SECURITY_* from a .env file."""
+        (tmp_path / ".env").write_text(
+            "SECURITY_BLOCKED_TABLES=audit_log,secrets\n"
+            "SECURITY_ALLOW_EXPLAIN=true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        config = SecurityConfig()
+        assert config.blocked_tables == ["audit_log", "secrets"]
+        assert config.allow_explain is True
+
+    def test_security_lists_from_os_env(self, monkeypatch) -> None:
+        """Comma-separated list env vars parse without JSON quoting."""
+        monkeypatch.setenv("SECURITY_BLOCKED_FUNCTIONS", "custom_fn, other_fn")
+        monkeypatch.setenv("SECURITY_BLOCKED_COLUMNS", "users.email")
+        config = SecurityConfig()
+        assert config.blocked_functions == ["custom_fn", "other_fn"]
+        assert config.blocked_columns == ["users.email"]
+
+    def test_os_env_overrides_dotenv(self, tmp_path, monkeypatch) -> None:
+        """Real environment variables take precedence over .env values."""
+        (tmp_path / ".env").write_text("DATABASE_PORT=5433\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("DATABASE_PORT", "6543")
+        config = DatabaseConfig()
+        assert config.port == 6543
+
+    def test_settings_databases_file_from_dotenv(self, tmp_path, monkeypatch) -> None:
+        """Top-level Settings reads DATABASES_FILE from a .env file."""
+        databases_file = tmp_path / "databases.json"
+        (tmp_path / ".env").write_text(
+            f"DATABASES_FILE={databases_file}\n"
+            "OPENAI_API_KEY=sk-test\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        settings = Settings()
+        assert settings.databases_file == str(databases_file)

@@ -66,6 +66,9 @@ logs/
 *.sqlite
 *.sqlite3
 
+# Local multi-database configuration (contains credentials; commit only the example)
+databases.json
+
 # Distribution / packaging
 *.tar.gz
 *.whl

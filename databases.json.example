@@ -1,0 +1,63 @@
+{
+  "_comment": "pg-mcp 多数据库配置示例。使用方法：cp databases.json.example databases.json 后按需修改，并在 .env 中设置 DATABASES_FILE=databases.json 启用多库模式（未设置则回退 .env 中 DATABASE_* 单库配置）。字段说明见 docs/DEVELOPMENT.md 第 8 节。注意：本 _comment 键会被配置加载器忽略，可安全保留或整行删除；文件含密码，databases.json 已被 .gitignore 忽略，切勿提交。以下三个库对应 fixtures/ 中 make create-all 创建的测试库（blog_small / ecommerce_medium / saas_crm_large），连接信息为本机 PostgreSQL 默认安装（见 docs/DEVELOPMENT.md 第 6 节）。",
+  "default_database": "blog_small",
+  "databases": [
+    {
+      "name": "blog_small",
+      "database": "blog_small",
+      "host": "localhost",
+      "port": 5432,
+      "user": "postgres",
+      "password": "postgres",
+      "pool": {
+        "min_size": 2,
+        "max_size": 10,
+        "timeout": 30.0,
+        "command_timeout": 30.0
+      },
+      "security": {
+        "blocked_tables": ["user_sessions"],
+        "blocked_columns": ["users.email"],
+        "allow_explain": false
+      }
+    },
+    {
+      "name": "ecommerce_medium",
+      "database": "ecommerce_medium",
+      "host": "localhost",
+      "port": 5432,
+      "user": "postgres",
+      "password": "postgres",
+      "pool": {
+        "min_size": 2,
+        "max_size": 10,
+        "timeout": 30.0,
+        "command_timeout": 30.0
+      },
+      "security": {
+        "blocked_tables": ["payments"],
+        "blocked_columns": ["users.password_hash"],
+        "allow_explain": false
+      }
+    },
+    {
+      "name": "saas_crm_large",
+      "database": "saas_crm_large",
+      "host": "localhost",
+      "port": 5432,
+      "user": "postgres",
+      "password": "postgres",
+      "pool": {
+        "min_size": 2,
+        "max_size": 10,
+        "timeout": 30.0,
+        "command_timeout": 30.0
+      },
+      "security": {
+        "blocked_tables": ["audit_logs", "webhook_deliveries"],
+        "blocked_columns": ["users.password_hash", "users.phone"],
+        "allow_explain": false
+      }
+    }
+  ]
+}

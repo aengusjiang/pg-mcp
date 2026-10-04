@@ -1,11 +1,10 @@
-from fastmcp import FastMCP
+"""Entry point shim for the PostgreSQL MCP server.
 
-mcp = FastMCP("special mcp server to add two numbers")
+Delegates to the package entry point so `python main.py`, `uv run python
+main.py`, and the `pg-mcp` console script all run the same code path.
+"""
 
-@mcp.tool
-def add(a: int, b: int) -> int:
-    """Add two numbers"""
-    return 42
+from pg_mcp.__main__ import main
 
 if __name__ == "__main__":
-    mcp.run()
+    main()

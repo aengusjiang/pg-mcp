@@ -385,15 +385,21 @@ class TestErrorModels:
         assert detail.message == "Invalid syntax"
         assert detail.details["position"] == 10
 
-    def test_error_detail_to_dict(self) -> None:
-        """Test ErrorDetail serialization."""
+    def test_error_detail_serialization(self) -> None:
+        """Test ErrorDetail serialization via model_dump."""
         detail = ErrorDetail(
             code=ErrorCode.DATABASE_ERROR,
             message="Connection failed",
         )
-        d = detail.to_dict()
+        d = detail.model_dump()
         assert d["code"] == ErrorCode.DATABASE_ERROR
         assert d["message"] == "Connection failed"
+
+    def test_error_detail_is_pydantic(self) -> None:
+        """Test ErrorDetail is the shared pydantic model."""
+        from pg_mcp.models.query import ErrorDetail as QueryErrorDetail
+
+        assert ErrorDetail is QueryErrorDetail
 
     def test_base_exception(self) -> None:
         """Test PgMcpError base exception."""

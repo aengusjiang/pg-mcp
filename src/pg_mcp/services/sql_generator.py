@@ -5,7 +5,7 @@ natural language questions into valid PostgreSQL SQL queries.
 """
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from openai import AsyncOpenAI
 
@@ -17,6 +17,19 @@ if TYPE_CHECKING:
     from openai.types.chat import ChatCompletion
 
     from pg_mcp.models.schema import DatabaseSchema
+
+
+class GenerationResult(NamedTuple):
+    """Outcome of a single LLM SQL generation call.
+
+    Attributes:
+        sql: The extracted SQL query (with trailing semicolon).
+        tokens_used: Total tokens reported by the API, None when the
+            response carried no usage information.
+    """
+
+    sql: str
+    tokens_used: int | None
 
 
 class SQLGenerator:
@@ -42,7 +55,11 @@ class SQLGenerator:
             config: OpenAI configuration including API key and model settings.
         """
         self.config = config
-        self.client = AsyncOpenAI(api_key=config.api_key.get_secret_value(), timeout=config.timeout)
+        self.client = AsyncOpenAI(
+            api_key=config.api_key.get_secret_value(),
+            base_url=config.base_url,
+            timeout=config.timeout,
+        )
 
     async def generate(
         self,
@@ -51,7 +68,7 @@ class SQLGenerator:
         context: str | None = None,
         previous_attempt: str | None = None,
         error_feedback: str | None = None,
-    ) -> str:
+    ) -> GenerationResult:
         """Generate SQL statement from natural language question.
 
         This method sends the question and database schema to OpenAI's API
@@ -66,7 +83,8 @@ class SQLGenerator:
             error_feedback: Error message from previous attempt (for retry).
 
         Returns:
-            str: Generated SQL query (without trailing semicolon).
+            GenerationResult: The generated SQL and token usage (None when
+                the API response carried no usage data).
 
         Raises:
             LLMError: If generation fails or response is invalid.
@@ -75,12 +93,12 @@ class SQLGenerator:
 
         Example:
             >>> # Initial generation
-            >>> sql = await generator.generate(
+            >>> result = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema
             ... )
             >>> # Retry with error feedback
-            >>> sql = await generator.generate(
+            >>> result = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema,
             ...     previous_attempt="SELECT COUNT(*) FROM user",
@@ -149,7 +167,11 @@ class SQLGenerator:
                 details={"content": content},
             )
 
-        return sql
+        tokens_used: int | None = None
+        if response.usage is not None and response.usage.total_tokens is not None:
+            tokens_used = int(response.usage.total_tokens)
+
+        return GenerationResult(sql=sql, tokens_used=tokens_used)
 
     def _extract_sql(self, content: str) -> str | None:
         """Extract SQL query from LLM response content.
@@ -184,7 +206,7 @@ class SQLGenerator:
         matches = re.findall(code_block_pattern, content, re.DOTALL | re.IGNORECASE)
 
         if matches:
-            sql = matches[0].strip()
+            sql: str = matches[0].strip()
             # Remove trailing semicolon for consistency
             return sql.rstrip(";") + ";"
 

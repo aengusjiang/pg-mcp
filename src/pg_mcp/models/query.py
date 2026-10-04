@@ -9,6 +9,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from pg_mcp.models.errors import ErrorDetail as ErrorDetail  # re-export
+
 
 class ReturnType(StrEnum):
     """Type of return value requested by the client."""
@@ -127,49 +129,43 @@ class QueryResult(BaseModel):
             return len(info.data["rows"])
         return v
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert result to dictionary.
-
-        Returns:
-            dict: Dictionary representation of query result.
-        """
-        return self.model_dump()
-
-
-class ErrorDetail(BaseModel):
-    """Detailed error information."""
-
-    code: str = Field(..., description="Error code identifier")
-    message: str = Field(..., description="Human-readable error message")
-    details: dict[str, Any] | None = Field(None, description="Additional error context")
-
 
 class QueryResponse(BaseModel):
     """Complete query response to client."""
 
     success: bool = Field(..., description="Whether query succeeded")
-    generated_sql: str | None = Field(None, description="Generated SQL query")
-    validation: ValidationResult | None = Field(None, description="SQL validation results")
-    data: QueryResult | None = Field(None, description="Query result data (if executed)")
-    error: ErrorDetail | None = Field(None, description="Error information if failed")
+    generated_sql: str | None = Field(default=None, description="Generated SQL query")
+    validation: ValidationResult | None = Field(
+        default=None, description="SQL validation results"
+    )
+    data: QueryResult | None = Field(default=None, description="Query result data (if executed)")
+    error: ErrorDetail | None = Field(default=None, description="Error information if failed")
     confidence: int = Field(
         default=100, ge=0, le=100, description="Confidence score of generated SQL (0-100)"
     )
-    tokens_used: int | None = Field(None, ge=0, description="LLM tokens used for generation")
+    # default= must stay keyword-form: mypy's dataclass_transform only
+    # recognizes keyword defaults, and would otherwise mark these required.
+    tokens_used: int | None = Field(
+        default=None, ge=0, description="LLM tokens used for generation (0 when unknown)"
+    )
+    request_id: str | None = Field(
+        default=None,
+        description="Request ID for tracing this query through the pipeline",
+    )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert response to dictionary for MCP tool return.
 
+        The envelope keeps the compact ``exclude_none`` shape: optional fields
+        that were not set are omitted, except ``tokens_used`` which is always
+        present (0 when unknown) so clients can rely on it.
+
         Returns:
             dict: Dictionary representation compatible with MCP protocol.
         """
-        # Use model_dump but ensure tokens_used is always present
-        result = self.model_dump(exclude_none=False)
-
-        # Ensure tokens_used is always present (use 0 if None)
+        result = self.model_dump(exclude_none=True)
         if result.get("tokens_used") is None:
             result["tokens_used"] = 0
-
         return result
 
     @field_validator("data")
@@ -210,11 +206,3 @@ class QueryResponse(BaseModel):
             if not success and v is None:
                 raise ValueError("Error must be present when success is False")
         return v
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert response to dictionary.
-
-        Returns:
-            dict: Dictionary representation of query response.
-        """
-        return self.model_dump(exclude_none=True)
