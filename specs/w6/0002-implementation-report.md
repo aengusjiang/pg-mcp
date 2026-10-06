@@ -210,7 +210,13 @@ pg_mcp_sql_rejected_total{reason="SecurityViolationError"}            1.0
 
 ### 7.1 多数据库路由与安全拦截（真实 MCP 会话）
 
-下图为真实冒烟会话记录（stdio 传输，LLM 为经 OpenAI 兼容网关接入的 `glm-5.3`）：前两例展示同一次会话内按 `database` 参数路由到两个不同连接池并返回正确聚合结果；第三例展示 `blocked_tables` 策略在 SQL 校验层拦截违禁表查询（`security_violation`，查询未触达数据库）；第四例展示未知库名的错误信封（附可用数据库列表）；第五例展示省略 `database` 时回落默认库。每个响应均携带贯穿全链路的 `request_id` 与如实的 `tokens_used`。
+**动态演示**（约 25 秒，循环播放）——完整冒烟会话的终端动画，依次演示命令启动、五例查询（多库路由 → 安全拦截 → 未知库错误信封 → 默认库回落）与 `/metrics` 抓取，以 `smoke result: PASS` 收尾：
+
+![MCP 冒烟会话动态演示](../../docs/images/smoke-demo.gif)
+
+> 动画按真实冒烟会话的输出逐行重绘为终端演示样式（stdio 传输的服务端日志会与会话输出混流，原始录屏不适合作展示画面），画面内容与下述静态记录同源。
+
+下图为该会话的静态全量记录（stdio 传输，LLM 为经 OpenAI 兼容网关接入的 `glm-5.3`）：前两例展示同一次会话内按 `database` 参数路由到两个不同连接池并返回正确聚合结果；第三例展示 `blocked_tables` 策略在 SQL 校验层拦截违禁表查询（`security_violation`，查询未触达数据库）；第四例展示未知库名的错误信封（附可用数据库列表）；第五例展示省略 `database` 时回落默认库。每个响应均携带贯穿全链路的 `request_id` 与如实的 `tokens_used`。
 
 ![MCP 冒烟会话：多库路由与安全拦截](../../docs/images/smoke-session.png)
 
