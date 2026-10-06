@@ -226,6 +226,26 @@ pg_mcp_sql_rejected_total{reason="SecurityViolationError"}            1.0
 
 ![Prometheus 指标输出](../../docs/images/prometheus-metrics.png)
 
+### 7.3 图形界面客户端（MCP Inspector）
+
+**动态演示**（约 57 秒，循环播放）——从服务端启动到图形客户端查询的完整三幕动画：
+
+![MCP Inspector 全流程动态演示](../../docs/images/inspector-demo.gif)
+
+> 动画第一幕按真实启动日志逐行重绘终端画面（stdio 传输的服务端日志会与客户端输出混流，原始录屏不适合作展示画面），第二、三幕为 MCP Inspector 真实操作录屏帧。**画面中红色标注 = 本次新增 / 增强功能**（★ 新增 / ★ 增强）。
+
+三幕内容依次为：
+
+1. **服务端启动**（终端动画）——`uv run python main.py` 启动后，启动日志依次打出本次增强的各个能力点：数据库注册表解析出 3 个库（★ 新增）、每库独立连接池与「validator + executor」安全执行组件（★ 新增 / ★ 增强）、三库 schema 内省（10 / 30 / 55 张表）、指标服务就绪（★ 增强）、按库名路由的查询编排器创建（★ 新增），直至 `Server ready to accept requests`。
+2. **连接 MCP 客户端**——官方调试客户端 MCP Inspector 的 Servers 面板中开启 pg-mcp 条目，约 12 秒后显示 `Connected`（★ 新增 ▸ 多库注册标注）。
+3. **自然语言查询**——Tools 面板填入问题「统计每个用户的文章数」并显式指定 `database=blog_small`（★ 新增 ▸ database 参数路由标注），点击 Execute Tool（链路标注：LLM 生成 SQL → sqlglot 安全校验 → 只读事务执行），约 30 秒真实 LLM 往返后返回结果，响应统一信封（`success` / `generated_sql` / `request_id` / `tokens_used`）获 ★ 增强标注。
+
+下图为第三幕结果画面的静态特写（另一次会话，约 18 秒 LLM 往返）：结果区展示完整响应信封——`success: true`、`generated_sql`（`SELECT u.id AS user_id, u.username, ...`）与聚合行数据（Alice Johnson 4 篇、Bob Smith 4 篇、Frank Miller 2 篇……）；右侧 Messages 面板同步记录 MCP 协议时间线（`TOOLS/CALL` 完成态），可见请求-校验-执行全链路行为与 7.1 的 stdio 会话一致。
+
+![MCP Inspector 图形界面执行查询](../../docs/images/inspector-query.png)
+
+pg-mcp 遵循 MCP 架构，自身无自带界面，由 MCP 客户端提供交互层；同一服务器无需任何改动即可接入 Claude Desktop 等终端用户客户端，接入方式见 `docs/DEVELOPMENT.md`。
+
 ---
 
 ## 8. 变更规模
