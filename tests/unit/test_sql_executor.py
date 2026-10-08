@@ -149,7 +149,13 @@ class TestSQLExecutor:
 
         # Verify session parameters were set
         assert mock_connection.execute.call_count >= 2  # timeout and search_path
-        mock_connection.fetch.assert_called_once_with(sql)
+
+        # Verify the row limit was pushed down as a subquery wrapper
+        mock_connection.fetch.assert_called_once()
+        fetched_sql = mock_connection.fetch.call_args[0][0]
+        assert fetched_sql.startswith("SELECT * FROM (")
+        assert "SELECT id, name FROM users" in fetched_sql
+        assert fetched_sql.endswith("AS _limited LIMIT 10001")  # max_rows(10000) + 1
 
     @pytest.mark.asyncio
     async def test_execute_with_custom_timeout_and_max_rows(
@@ -174,10 +180,13 @@ class TestSQLExecutor:
         )
 
         # Assert
-        assert count == 200  # Total count before limiting
+        assert count == 100  # Capped at max_rows when truncated
         assert len(results) == 100  # Limited to max_rows
         assert results[0]["id"] == 0
         assert results[99]["id"] == 99
+        # The row limit was pushed into the SQL sent to the database
+        fetched_sql = mock_connection.fetch.call_args[0][0]
+        assert fetched_sql.endswith("AS _limited LIMIT 101")  # max_rows(100) + 1
 
     @pytest.mark.asyncio
     async def test_execute_timeout_error(
@@ -586,11 +595,14 @@ class TestRowLimiting:
         results, count = await executor.execute(sql, max_rows=max_rows)
 
         # Assert
-        assert count == 100  # Total count
+        assert count == 10  # Capped at max_rows when truncated
         assert len(results) == 10  # Limited results
         # Verify we got the first N rows
         for i in range(10):
             assert results[i]["id"] == i
+        # The row limit was pushed into the SQL sent to the database
+        fetched_sql = mock_connection.fetch.call_args[0][0]
+        assert fetched_sql.endswith("AS _limited LIMIT 11")  # max_rows(10) + 1
 
     @pytest.mark.asyncio
     async def test_row_limiting_not_exceeded(
@@ -614,3 +626,25 @@ class TestRowLimiting:
         # Assert
         assert count == 10
         assert len(results) == 10  # All results returned
+
+
+class TestWrapWithLimit:
+    """Test suite for the row-limit pushdown wrapper."""
+
+    def test_plain_select_is_wrapped(self, executor: SQLExecutor) -> None:
+        """A SELECT is wrapped in a LIMIT-ed outer query."""
+        wrapped = executor._wrap_with_limit("SELECT id FROM users", 100)
+
+        assert wrapped == "SELECT * FROM (SELECT id FROM users) AS _limited LIMIT 101"
+
+    def test_trailing_semicolon_stripped(self, executor: SQLExecutor) -> None:
+        """A trailing semicolon is removed before wrapping."""
+        wrapped = executor._wrap_with_limit("SELECT 1;", 10)
+
+        assert wrapped == "SELECT * FROM (SELECT 1) AS _limited LIMIT 11"
+
+    def test_explain_is_passed_through(self, executor: SQLExecutor) -> None:
+        """EXPLAIN statements cannot be subqueried and pass through unchanged."""
+        explain_sql = "EXPLAIN SELECT * FROM users"
+
+        assert executor._wrap_with_limit(explain_sql, 100) == explain_sql

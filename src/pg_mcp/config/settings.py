@@ -5,16 +5,21 @@ and type safety. Configuration is loaded from environment variables with
 sensible defaults.
 """
 
-from typing import Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class DatabaseConfig(BaseSettings):
     """PostgreSQL database connection configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="DATABASE_")
+    # env_file is required on every nested section: pydantic-settings does
+    # not propagate the parent's dotenv source, so without it a plain .env
+    # file is silently ignored for DATABASE_*/OPENAI_*/... variables.
+    model_config = SettingsConfigDict(
+        env_prefix="DATABASE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     host: str = Field(default="localhost", description="Database host")
     port: int = Field(default=5432, ge=1, le=65535, description="Database port")
@@ -46,7 +51,9 @@ class DatabaseConfig(BaseSettings):
 class OpenAIConfig(BaseSettings):
     """OpenAI API configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="OPENAI_")
+    model_config = SettingsConfigDict(
+        env_prefix="OPENAI_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     api_key: SecretStr = Field(default=SecretStr(""), description="OpenAI API key")
     model: str = Field(default="gpt-4o-mini", description="Model to use for SQL generation")
@@ -57,28 +64,56 @@ class OpenAIConfig(BaseSettings):
     timeout: float = Field(
         default=30.0, ge=5.0, le=120.0, description="API request timeout in seconds"
     )
+    base_url: str | None = Field(
+        default=None,
+        description="Base URL of an OpenAI-compatible API gateway "
+        "(e.g. a self-hosted or third-party endpoint). When set, the API key "
+        "may use the gateway's own format instead of the 'sk-' prefix",
+    )
 
     @field_validator("api_key")
     @classmethod
     def validate_api_key(cls, v: SecretStr) -> SecretStr:
-        """Validate API key is not empty and has correct format."""
+        """Validate API key is not empty."""
         api_key_str = v.get_secret_value()
         if not api_key_str or not api_key_str.strip():
             raise ValueError("OpenAI API key must not be empty")
-        if not api_key_str.startswith("sk-"):
-            raise ValueError("OpenAI API key must start with 'sk-'")
         return v
+
+    @model_validator(mode="after")
+    def validate_key_format_for_endpoint(self) -> Self:
+        """Cross-field validation of key format and base URL scheme.
+
+        Rules:
+        - base_url must be an http(s) URL when provided;
+        - against the official OpenAI API (no base_url) the key must start
+          with 'sk-'; a custom gateway may use its own key format, so the
+          prefix requirement only applies to the official endpoint.
+        """
+        if self.base_url is not None:
+            if not self.base_url.startswith(("http://", "https://")):
+                raise ValueError("OPENAI_BASE_URL must start with 'http://' or 'https://'")
+        else:
+            api_key_str = self.api_key.get_secret_value()
+            if not api_key_str.startswith("sk-"):
+                raise ValueError(
+                    "OpenAI API key must start with 'sk-' "
+                    "(or set OPENAI_BASE_URL when using an OpenAI-compatible gateway)"
+                )
+        return self
 
 
 class SecurityConfig(BaseSettings):
     """Security and access control configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="SECURITY_")
-
-    allow_write_operations: bool = Field(
-        default=False, description="Allow write operations (INSERT, UPDATE, DELETE)"
+    model_config = SettingsConfigDict(
+        env_prefix="SECURITY_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
-    blocked_functions: list[str] = Field(
+
+    # NoDecode keeps env/dotenv values as raw strings so the comma-separated
+    # format works: without it pydantic-settings would try json.loads() on
+    # "pg_sleep, pg_read_file" and fail before the field validator runs.
+    blocked_functions: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: [
             "pg_sleep",
             "pg_read_file",
@@ -87,6 +122,19 @@ class SecurityConfig(BaseSettings):
             "lo_export",
         ],
         description="List of blocked PostgreSQL functions",
+    )
+    blocked_tables: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description="List of blocked tables (global default; per-database overrides exist)",
+    )
+    blocked_columns: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description="List of blocked columns, optionally as 'table.column' "
+        "(global default; per-database overrides exist)",
+    )
+    allow_explain: bool = Field(
+        default=False,
+        description="Whether EXPLAIN statements are allowed (global default)",
     )
     max_rows: int = Field(default=10000, ge=1, le=100000, description="Maximum rows to return")
     max_execution_time: float = Field(
@@ -99,25 +147,20 @@ class SecurityConfig(BaseSettings):
         default="public", description="Safe search_path to set during query execution"
     )
 
-    @field_validator("blocked_functions", mode="before")
+    @field_validator("blocked_functions", "blocked_tables", "blocked_columns", mode="before")
     @classmethod
-    def parse_blocked_functions(cls, v: str | list[str]) -> list[str]:
+    def parse_string_list(cls, v: str | list[str]) -> list[str]:
         """Parse comma-separated string or list."""
         if isinstance(v, str):
-            return [f.strip() for f in v.split(",") if f.strip()]
+            return [item.strip() for item in v.split(",") if item.strip()]
         return v
 
 
 class ValidationConfig(BaseSettings):
     """Query validation configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="VALIDATION_")
-
-    max_question_length: int = Field(
-        default=10000, ge=1, le=50000, description="Maximum question length in characters"
-    )
-    min_confidence_score: int = Field(
-        default=70, ge=0, le=100, description="Minimum confidence score (0-100)"
+    model_config = SettingsConfigDict(
+        env_prefix="VALIDATION_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
     # Result validation settings
@@ -136,7 +179,9 @@ class ValidationConfig(BaseSettings):
 class CacheConfig(BaseSettings):
     """Schema cache configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="CACHE_")
+    model_config = SettingsConfigDict(
+        env_prefix="CACHE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     schema_ttl: int = Field(
         default=3600, ge=60, le=86400, description="Schema cache TTL in seconds"
@@ -148,7 +193,9 @@ class CacheConfig(BaseSettings):
 class ResilienceConfig(BaseSettings):
     """Resilience and fault tolerance configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="RESILIENCE_")
+    model_config = SettingsConfigDict(
+        env_prefix="RESILIENCE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     max_retries: int = Field(default=3, ge=0, le=10, description="Maximum retry attempts")
     retry_delay: float = Field(
@@ -163,12 +210,33 @@ class ResilienceConfig(BaseSettings):
     circuit_breaker_timeout: float = Field(
         default=60.0, ge=10.0, le=300.0, description="Circuit breaker timeout in seconds"
     )
+    query_concurrency: int = Field(
+        default=10,
+        ge=1,
+        le=1000,
+        description="Maximum concurrent database queries (semaphore-based)",
+    )
+    llm_concurrency: int = Field(
+        default=5,
+        ge=1,
+        le=1000,
+        description="Maximum concurrent LLM API calls (semaphore-based)",
+    )
+    rate_limit_timeout: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=300.0,
+        description="Seconds a request may wait for a concurrency slot "
+        "before failing with rate_limit_exceeded",
+    )
 
 
 class ObservabilityConfig(BaseSettings):
     """Observability and monitoring configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="OBSERVABILITY_")
+    model_config = SettingsConfigDict(
+        env_prefix="OBSERVABILITY_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     metrics_enabled: bool = Field(default=True, description="Enable Prometheus metrics")
     metrics_port: int = Field(
@@ -177,7 +245,7 @@ class ObservabilityConfig(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO", description="Logging level"
     )
-    log_format: Literal["json", "text"] = Field(default="text", description="Log format")
+    log_format: Literal["json", "text"] = Field(default="json", description="Log format")
 
 
 class Settings(BaseSettings):
@@ -193,6 +261,11 @@ class Settings(BaseSettings):
     environment: Literal["development", "staging", "production"] = Field(
         default="development", description="Application environment"
     )
+    databases_file: str | None = Field(
+        default=None,
+        description="Path to databases.json for multi-database configuration; "
+        "when unset, the single DATABASE_* configuration is used",
+    )
 
     # Nested configurations
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -202,16 +275,6 @@ class Settings(BaseSettings):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
-
-    @property
-    def is_production(self) -> bool:
-        """Check if running in production environment."""
-        return self.environment == "production"
-
-    @property
-    def is_development(self) -> bool:
-        """Check if running in development environment."""
-        return self.environment == "development"
 
 
 # Global settings instance

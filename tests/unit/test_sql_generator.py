@@ -18,7 +18,46 @@ from pg_mcp.models.schema import (
     IndexInfo,
     TableInfo,
 )
-from pg_mcp.services.sql_generator import SQLGenerator
+from pg_mcp.services.sql_generator import GenerationResult, SQLGenerator
+
+
+def _completion(content: str, total_tokens: int | None = 120) -> MagicMock:
+    """Build a mocked ChatCompletion with content and optional usage.
+
+    Args:
+        content: Raw message content from the LLM.
+        total_tokens: Reported total token usage (None = no usage data).
+
+    Returns:
+        MagicMock shaped like an OpenAI ChatCompletion.
+    """
+    response = MagicMock()
+    response.choices = [MagicMock(message=MagicMock(content=content))]
+    if total_tokens is None:
+        response.usage = None
+    else:
+        response.usage = MagicMock(total_tokens=total_tokens)
+    return response
+
+
+class TestClientConstruction:
+    """Test AsyncOpenAI client wiring (API key, gateway base_url, timeout)."""
+
+    def test_client_uses_official_endpoint_by_default(self) -> None:
+        """Without base_url the client targets the official OpenAI API."""
+        config = OpenAIConfig(api_key=SecretStr("sk-test-key-12345"))
+        generator = SQLGenerator(config)
+        assert generator.client.base_url == "https://api.openai.com/v1/"
+
+    def test_client_uses_configured_gateway_base_url(self) -> None:
+        """A custom base_url routes requests to the OpenAI-compatible gateway."""
+        config = OpenAIConfig(
+            api_key=SecretStr("gw-style-key"),
+            base_url="https://open.bigmodel.cn/api/paas/v4",
+        )
+        generator = SQLGenerator(config)
+        # The SDK normalizes the base URL with a trailing slash
+        assert str(generator.client.base_url) == "https://open.bigmodel.cn/api/paas/v4/"
 
 
 class TestSQLExtraction:
@@ -280,10 +319,7 @@ class TestSQLGenerator:
         self, generator: SQLGenerator, mock_schema: DatabaseSchema
     ) -> None:
         """Test simple query generation with mocked OpenAI response."""
-        mock_response = MagicMock()
-        mock_response.choices = [
-            MagicMock(message=MagicMock(content="```sql\nSELECT * FROM users;\n```"))
-        ]
+        mock_response = _completion("```sql\nSELECT * FROM users;\n```", total_tokens=120)
 
         # Use AsyncMock for async method
         with patch.object(
@@ -302,21 +338,18 @@ class TestSQLGenerator:
             assert call_kwargs["messages"][1]["role"] == "user"
 
             # Verify result
-            assert result == "SELECT * FROM users;"
+            assert isinstance(result, GenerationResult)
+            assert result.sql == "SELECT * FROM users;"
+            assert result.tokens_used == 120
 
     @pytest.mark.asyncio
     async def test_generate_with_context(
         self, generator: SQLGenerator, mock_schema: DatabaseSchema
     ) -> None:
         """Test generation with additional context."""
-        mock_response = MagicMock()
-        mock_response.choices = [
-            MagicMock(
-                message=MagicMock(
-                    content="```sql\nSELECT COUNT(*) FROM users WHERE status = 'active';\n```"
-                )
-            )
-        ]
+        mock_response = _completion(
+            "```sql\nSELECT COUNT(*) FROM users WHERE status = 'active';\n```"
+        )
 
         with patch.object(
             generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
@@ -327,18 +360,15 @@ class TestSQLGenerator:
                 context="Only count users with status='active'",
             )
 
-            assert "SELECT COUNT(*)" in result
-            assert result.endswith(";")
+            assert "SELECT COUNT(*)" in result.sql
+            assert result.sql.endswith(";")
 
     @pytest.mark.asyncio
     async def test_generate_with_retry_context(
         self, generator: SQLGenerator, mock_schema: DatabaseSchema
     ) -> None:
         """Test generation with retry context (previous attempt + error)."""
-        mock_response = MagicMock()
-        mock_response.choices = [
-            MagicMock(message=MagicMock(content="```sql\nSELECT COUNT(*) FROM users;\n```"))
-        ]
+        mock_response = _completion("```sql\nSELECT COUNT(*) FROM users;\n```")
 
         with patch.object(
             generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
@@ -356,7 +386,7 @@ class TestSQLGenerator:
             assert "SELECT COUNT(*) FROM user" in user_prompt
             assert 'relation "user" does not exist' in user_prompt
 
-            assert result == "SELECT COUNT(*) FROM users;"
+            assert result.sql == "SELECT COUNT(*) FROM users;"
 
     @pytest.mark.asyncio
     async def test_generate_handles_llm_timeout(
@@ -471,8 +501,7 @@ INNER JOIN recent_orders ro ON u.id = ro.user_id
 ORDER BY ro.order_count DESC
 LIMIT 10;"""
 
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content=f"```sql\n{cte_sql}\n```"))]
+        mock_response = _completion(f"```sql\n{cte_sql}\n```")
 
         with patch.object(
             generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
@@ -481,8 +510,8 @@ LIMIT 10;"""
                 "Show top 10 users by order count in last 30 days", mock_schema
             )
 
-            assert result.startswith("WITH recent_orders")
-            assert "LIMIT 10;" in result
+            assert result.sql.startswith("WITH recent_orders")
+            assert "LIMIT 10;" in result.sql
 
     @pytest.mark.asyncio
     async def test_generate_respects_config_settings(self, mock_schema: DatabaseSchema) -> None:
@@ -545,3 +574,32 @@ LIMIT 10;"""
 
             assert "OpenAI API request failed" in str(exc_info.value)
             assert exc_info.value.details["error"] == "Unknown error occurred"
+
+    @pytest.mark.asyncio
+    async def test_generate_reports_token_usage(
+        self, generator: SQLGenerator, mock_schema: DatabaseSchema
+    ) -> None:
+        """Token usage reported by the API is surfaced in the result."""
+        mock_response = _completion("```sql\nSELECT 1;\n```", total_tokens=987)
+
+        with patch.object(
+            generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
+        ):
+            result = await generator.generate("Test query", mock_schema)
+
+        assert result.tokens_used == 987
+
+    @pytest.mark.asyncio
+    async def test_generate_tokens_none_without_usage(
+        self, generator: SQLGenerator, mock_schema: DatabaseSchema
+    ) -> None:
+        """Token usage is None when the response carries no usage data."""
+        mock_response = _completion("```sql\nSELECT 1;\n```", total_tokens=None)
+
+        with patch.object(
+            generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
+        ):
+            result = await generator.generate("Test query", mock_schema)
+
+        assert result.sql == "SELECT 1;"
+        assert result.tokens_used is None

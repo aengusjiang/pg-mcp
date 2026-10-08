@@ -74,6 +74,21 @@ class SQLValidator:
         "copy_to",
     }
 
+    # EXPLAIN option keywords that may precede the explained statement.
+    # ANALYZE/ANALYSE actually execute the inner statement and are always
+    # rejected (even with allow_explain=True); the rest are plan-only options.
+    EXPLAIN_OPTIONS: ClassVar = {
+        "ANALYZE",
+        "ANALYSE",
+        "VERBOSE",
+        "COSTS",
+        "BUFFERS",
+        "TIMING",
+        "SUMMARY",
+    }
+    EXPLAIN_VALUE_OPTIONS: ClassVar = {"FORMAT"}
+    EXPLAIN_BOOLEAN_VALUES: ClassVar = {"ON", "OFF", "TRUE", "FALSE"}
+
     def __init__(
         self,
         config: SecurityConfig,
@@ -154,12 +169,7 @@ class SQLValidator:
             # Check if it's an EXPLAIN command
             cmd_name = str(statement.this).upper() if statement.this else ""
             if cmd_name == "EXPLAIN":
-                if not self.allow_explain:
-                    raise SecurityViolationError("EXPLAIN statements are not allowed")
-                # EXPLAIN is read-only and safe - it only shows query plans without executing.
-                # sqlglot 28.5.0 cannot parse EXPLAIN syntax reliably (falls back to Command),
-                # so we don't attempt to validate the inner query string to avoid false positives.
-                # Even "EXPLAIN DELETE" is safe as it won't actually delete data.
+                self._validate_explain(statement)
                 return None
             else:
                 # Other commands are not allowed
@@ -190,8 +200,101 @@ class SQLValidator:
         if error := self._check_blocked_columns(statement):
             raise SecurityViolationError(error)
 
+        if error := self._check_cte_safety(statement):
+            raise SecurityViolationError(error)
+
         if error := self._check_subquery_safety(statement):
             raise SecurityViolationError(error)
+
+    def _validate_explain(self, statement: exp.Command) -> None:
+        """Validate an EXPLAIN statement by validating its inner query.
+
+        sqlglot 28.5.0 parses ``EXPLAIN ...`` as a Command whose expression
+        literal holds the remainder of the statement. Policy:
+
+        - ``allow_explain`` disabled -> reject.
+        - ``ANALYZE``/``ANALYSE`` option present -> reject even when enabled
+          (it executes the inner statement; a separate opt-in may be added
+          in the future, but none exists today).
+        - Otherwise strip the plan options and run the inner statement
+          through the full validation pipeline (statement type, dangerous
+          functions, blocked tables/columns, subquery safety).
+        - If the inner statement cannot be extracted or parsed -> reject
+          (fail-closed).
+
+        Args:
+            statement: The parsed EXPLAIN Command node.
+
+        Raises:
+            SecurityViolationError: When EXPLAIN is disabled, ANALYZE is
+                requested, or the inner statement violates security rules.
+            SQLParseError: When the inner statement cannot be parsed.
+        """
+        if not self.allow_explain:
+            raise SecurityViolationError("EXPLAIN statements are not allowed")
+
+        remainder = ""
+        if isinstance(statement.expression, exp.Literal):
+            remainder = str(statement.expression.this)
+
+        inner_sql, has_analyze = self._strip_explain_options(remainder)
+        if has_analyze:
+            raise SecurityViolationError(
+                "EXPLAIN ANALYZE is not allowed: ANALYZE executes the inner statement "
+                "(no separate opt-in exists; plain EXPLAIN is permitted when enabled)"
+            )
+        if not inner_sql.strip():
+            raise SQLParseError("EXPLAIN statement has no inner query to validate")
+
+        # Fail-closed: the inner statement goes through the complete pipeline.
+        self.validate_or_raise(inner_sql)
+
+    def _strip_explain_options(self, remainder: str) -> tuple[str, bool]:
+        """Strip leading EXPLAIN option modifiers from the statement text.
+
+        Args:
+            remainder: Text following the EXPLAIN keyword (e.g.
+                "ANALYZE SELECT * FROM users" or "(ANALYZE, BUFFERS) SELECT 1").
+
+        Returns:
+            Tuple of (inner_sql, has_analyze): the statement with option
+            modifiers removed, and whether an ANALYZE option was seen.
+        """
+        text = remainder.strip()
+        has_analyze = False
+
+        while text:
+            # Parenthesized option list: (ANALYZE, BUFFERS, ...)
+            if text.startswith("("):
+                close = text.find(")")
+                if close == -1:
+                    break  # malformed; left for the parser to fail closed
+                for option in text[1:close].split(","):
+                    if option.strip().upper() in ("ANALYZE", "ANALYSE"):
+                        has_analyze = True
+                text = text[close + 1 :].lstrip()
+                continue
+
+            first, _, rest = text.partition(" ")
+            keyword = first.upper()
+
+            if keyword in ("ANALYZE", "ANALYSE"):
+                has_analyze = True
+                text = rest.lstrip()
+                continue
+            if keyword in self.EXPLAIN_OPTIONS:
+                text = rest.lstrip()
+                # TIMING/SUMMARY may carry an ON/OFF value
+                if text.partition(" ")[0].upper() in self.EXPLAIN_BOOLEAN_VALUES:
+                    text = text.partition(" ")[2].lstrip()
+                continue
+            if keyword in self.EXPLAIN_VALUE_OPTIONS:
+                # e.g. FORMAT JSON - consume the option and its value
+                text = rest.partition(" ")[2].lstrip()
+                continue
+            break
+
+        return text, has_analyze
 
     def _check_statement_type(self, statement: exp.Expression) -> str | None:
         """Check if statement type is allowed.
@@ -257,6 +360,21 @@ class SQLValidator:
     def _check_blocked_columns(self, statement: exp.Expression) -> str | None:
         """Check for access to blocked columns.
 
+        Blocked columns are configured as bare names ("email") or qualified
+        names ("users.email"). A reference is rejected when any of its
+        spellings resolves to a blocked entry:
+
+        - bare name matching a bare entry ("email" vs "email")
+        - qualified name matching a qualified entry ("users.email")
+        - qualified name whose table part is an alias that resolves to a
+          blocked table ("u.email" with "FROM users u" vs "users.email")
+        - bare name whose statement reads a table holding that blocked
+          column ("email" with "FROM users" vs "users.email") — closed on
+          ambiguity because the server cannot know which table the user
+          meant
+        - a ``*`` or ``table.*`` projection over a table that has any
+          blocked column
+
         Args:
             statement: Parsed SQL statement.
 
@@ -266,19 +384,105 @@ class SQLValidator:
         if not self.blocked_columns:
             return None
 
-        # Find all column references
+        # Split entries into bare names and table-column pairs. Entries with
+        # a schema prefix ("public.users.email") keep their last two parts.
+        blocked_bare: set[str] = set()
+        blocked_by_column: dict[str, set[str]] = {}
+        for entry in self.blocked_columns:
+            parts = entry.lower().split(".")
+            if len(parts) >= 2:
+                blocked_by_column.setdefault(parts[-1], set()).add(parts[-2])
+            else:
+                blocked_bare.add(parts[0])
+
+        # Alias resolution: alias and bare table name -> real table name.
+        table_names: set[str] = set()
+        alias_to_table: dict[str, str] = {}
+        for table in statement.find_all(exp.Table):
+            real = table.name.lower()
+            table_names.add(real)
+            alias_to_table[real] = real
+            if table.alias:
+                alias_to_table[table.alias.lower()] = real
+
         for column in statement.find_all(exp.Column):
             column_name = column.name.lower() if column.name else ""
+            column_table = column.table.lower() if column.table else ""
 
-            # Check for exact match
-            if column_name in self.blocked_columns:
+            if isinstance(column.this, exp.Star):
+                # "table.*" projection: reject when that table has any
+                # blocked column.
+                source = alias_to_table.get(column_table, column_table)
+                if source and any(
+                    source in tables for tables in blocked_by_column.values()
+                ):
+                    return f"Access to all columns of '{source}' is not allowed"
+                continue
+
+            if not column_name:
+                continue
+            if column_name in blocked_bare:
                 return f"Access to column '{column_name}' is not allowed"
 
-            # Check for qualified column names (table.column)
-            if column.table:
-                qualified_name = f"{column.table.lower()}.{column_name}"
-                if qualified_name in self.blocked_columns:
-                    return f"Access to column '{qualified_name}' is not allowed"
+            blocked_tables = blocked_by_column.get(column_name)
+            if not blocked_tables:
+                continue
+            if column_table:
+                source = alias_to_table.get(column_table, column_table)
+                if source in blocked_tables:
+                    return f"Access to column '{source}.{column_name}' is not allowed"
+            else:
+                # Bare reference: fail closed when the statement reads a
+                # table whose copy of this column is blocked.
+                overlap = blocked_tables & table_names
+                if overlap:
+                    owner = sorted(overlap)[0]
+                    return f"Access to column '{owner}.{column_name}' is not allowed"
+
+        # Bare "*" projection: fail closed when any table read by this
+        # statement has blocked columns at all. Only stars in the SELECT
+        # projection list leak columns — COUNT(*) and similar aggregates
+        # (star inside a function) project nothing and are left alone.
+        for star in statement.find_all(exp.Star):
+            if not isinstance(star.parent, exp.Select):
+                continue  # table.* handled above; COUNT(*) projects nothing
+            for referenced in table_names:
+                if any(referenced in tables for tables in blocked_by_column.values()):
+                    return (
+                        f"Access to all columns of '{referenced}' is not allowed "
+                        "(some columns are blocked); list columns explicitly"
+                    )
+
+        return None
+
+    def _check_cte_safety(self, statement: exp.Expression) -> str | None:
+        """Check that CTE definitions only contain SELECT statements.
+
+        PostgreSQL allows data-modifying CTEs (``WITH del AS (DELETE ...)
+        SELECT ...``); sqlglot currently rejects them at parse time, but if
+        a future parser version accepts them this check keeps them blocked
+        (defense in depth).
+
+        Args:
+            statement: Parsed SQL statement.
+
+        Returns:
+            Error message if check fails, None otherwise.
+        """
+        for cte in statement.find_all(exp.CTE):
+            inner = cte.this
+            if inner is None:
+                continue
+
+            for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
+                if isinstance(inner, forbidden_type):
+                    stmt_name = forbidden_type.__name__.upper()
+                    return f"{stmt_name} statements in CTEs are not allowed"
+
+            if not isinstance(
+                inner, (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.With)
+            ):
+                return "CTEs must contain only SELECT statements"
 
         return None
 

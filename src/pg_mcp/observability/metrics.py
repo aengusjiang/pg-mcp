@@ -4,7 +4,9 @@ This module implements comprehensive metrics collection using prometheus_client,
 tracking query requests, LLM calls, database operations, and system health.
 """
 
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+import contextlib
+
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram, start_http_server
 
 
 class MetricsCollector:
@@ -124,6 +126,14 @@ class MetricsCollector:
         """
         self.query_requests.labels(status=status, database=database).inc()
 
+    def observe_query_duration(self, duration: float) -> None:
+        """Record end-to-end query request duration.
+
+        Args:
+            duration: Duration of the full request processing in seconds.
+        """
+        self.query_duration.observe(duration)
+
     def increment_llm_call(self, operation: str) -> None:
         """Increment LLM call counter.
 
@@ -187,10 +197,18 @@ class MetricsCollector:
     def reset_all_metrics(self) -> None:
         """Reset all metrics to initial state.
 
-        This method is primarily useful for testing purposes.
+        Unregisters the current collectors from the default registry before
+        re-creating them, so repeated calls (e.g. across tests) do not raise
+        ``Duplicated timeseries in CollectorRegistry``.
+
+        This method is primarily useful for testing purposes; in production,
+        metrics are cumulative.
         """
-        # Note: Prometheus client doesn't provide a clean way to reset metrics
-        # This is mainly for testing - in production, metrics are cumulative
+        for value in vars(self).values():
+            if isinstance(value, (Counter, Gauge, Histogram)):
+                with contextlib.suppress(KeyError):
+                    # Already unregistered (e.g. half-initialized instance)
+                    REGISTRY.unregister(value)
         self._initialize_metrics()
 
 

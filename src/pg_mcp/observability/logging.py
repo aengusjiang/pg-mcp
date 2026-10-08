@@ -269,6 +269,12 @@ def configure_logging(
 
     handler.setFormatter(formatter)
 
+    # Inject the current request_id (from the tracing contextvar) into every
+    # record emitted through this handler.
+    from pg_mcp.observability.tracing import RequestIdFilter
+
+    handler.addFilter(RequestIdFilter())
+
     # Add sensitive data filter
     if enable_sensitive_filter:
         handler.addFilter(SensitiveDataFilter())

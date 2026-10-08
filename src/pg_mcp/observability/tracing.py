@@ -24,6 +24,34 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
+class RequestIdFilter(logging.Filter):
+    """Logging filter that injects the current request ID into log records.
+
+    Unlike swapping the global log record factory (which races between
+    concurrent tasks), a filter reads the contextvar at emit time in the
+    task that actually logs, so request IDs never leak across requests.
+    Attach it once per handler via ``configure_logging``.
+
+    Records that already carry a ``request_id`` (e.g. passed via ``extra=``)
+    are left untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Attach the current request_id to the record, if any.
+
+        Args:
+            record: The log record being emitted.
+
+        Returns:
+            bool: Always True (the record is allowed through).
+        """
+        if not hasattr(record, "request_id"):
+            request_id = _request_id_var.get()
+            if request_id:
+                record.request_id = request_id
+        return True
+
+
 class TraceContext(BaseModel):
     """Trace context containing request tracking information.
 
@@ -122,10 +150,12 @@ async def request_context(request_id: str | None = None) -> AsyncIterator[str]:
 def trace_async(
     operation: str | None = None,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
-    """Decorator to trace async functions with request ID.
+    """Decorator marking an async function as part of a traced request.
 
-    Automatically injects request_id into log records and ensures
-    context propagation through async calls.
+    Request ID propagation happens through contextvars (inherited by
+    ``asyncio`` tasks automatically) and log injection through
+    :class:`RequestIdFilter`; this decorator is kept as an explicit
+    tracing annotation and call-through.
 
     Args:
         operation: Optional operation name. If not provided, uses function name.
@@ -141,32 +171,9 @@ def trace_async(
     """
 
     def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
-        op_name = operation or func.__name__
-
         @wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-            request_id = get_request_id()
-
-            if request_id:
-                # Create a log adapter that adds request_id to all log records
-                old_factory = logging.getLogRecordFactory()
-
-                def record_factory(*factory_args: Any, **factory_kwargs: Any) -> logging.LogRecord:
-                    record = old_factory(*factory_args, **factory_kwargs)
-                    record.request_id = request_id
-                    record.operation = op_name
-                    return record
-
-                logging.setLogRecordFactory(record_factory)
-
-                try:
-                    result = await func(*args, **kwargs)
-                    return result
-                finally:
-                    logging.setLogRecordFactory(old_factory)
-            else:
-                # No request context, just execute
-                return await func(*args, **kwargs)
+            return await func(*args, **kwargs)
 
         return wrapper
 
@@ -176,9 +183,10 @@ def trace_async(
 def trace_sync(
     operation: str | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """Decorator to trace synchronous functions with request ID.
+    """Decorator marking a sync function as part of a traced request.
 
-    Similar to trace_async but for synchronous functions.
+    See :func:`trace_async` — propagation is contextvar-based; this
+    decorator is an explicit annotation and call-through.
 
     Args:
         operation: Optional operation name. If not provided, uses function name.
@@ -194,30 +202,9 @@ def trace_sync(
     """
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
-        op_name = operation or func.__name__
-
         @wraps(func)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-            request_id = get_request_id()
-
-            if request_id:
-                old_factory = logging.getLogRecordFactory()
-
-                def record_factory(*factory_args: Any, **factory_kwargs: Any) -> logging.LogRecord:
-                    record = old_factory(*factory_args, **factory_kwargs)
-                    record.request_id = request_id
-                    record.operation = op_name
-                    return record
-
-                logging.setLogRecordFactory(record_factory)
-
-                try:
-                    result = func(*args, **kwargs)
-                    return result
-                finally:
-                    logging.setLogRecordFactory(old_factory)
-            else:
-                return func(*args, **kwargs)
+            return func(*args, **kwargs)
 
         return wrapper
 

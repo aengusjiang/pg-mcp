@@ -154,7 +154,7 @@ class TestRejectedStatements:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator for testing rejected statements."""
-        config = SecurityConfig(allow_write_operations=False)
+        config = SecurityConfig()
         return SQLValidator(config=config)
 
     def test_insert_rejected(self, validator: SQLValidator) -> None:
@@ -350,12 +350,65 @@ class TestSensitiveResources:
         validator = SQLValidator(config=config, blocked_columns=["users.ssn"])
 
         sql = "SELECT users.id, users.ssn FROM users"
-        # This should NOT be blocked because we check the column name without table prefix
-        # unless explicitly in the blocked list
-        is_valid, error = validator.validate(sql)
-        # Actually, it depends on implementation - let's test both scenarios
-        # The validator checks both column name and qualified name
-        assert is_valid or "ssn" in (error or "")
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "users.ssn" in str(exc_info.value).lower()
+
+    def test_qualified_column_bare_reference_blocked(self) -> None:
+        """A bare column reference cannot bypass a table.column block."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, blocked_columns=["users.email"])
+
+        sql = "SELECT email FROM users"
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "users.email" in str(exc_info.value).lower()
+
+    def test_qualified_column_alias_reference_blocked(self) -> None:
+        """An aliased table cannot bypass a table.column block."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, blocked_columns=["users.email"])
+
+        sql = "SELECT u.email FROM users u"
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "users.email" in str(exc_info.value).lower()
+
+    def test_qualified_column_star_projection_blocked(self) -> None:
+        """SELECT * cannot leak a blocked column."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, blocked_columns=["users.email"])
+
+        sql = "SELECT * FROM users"
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "users" in str(exc_info.value).lower()
+
+    def test_qualified_column_table_star_blocked(self) -> None:
+        """table.* projection cannot leak a blocked column."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, blocked_columns=["users.email"])
+
+        sql = "SELECT users.* FROM users"
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "users" in str(exc_info.value).lower()
+
+    def test_qualified_column_other_table_allowed(self) -> None:
+        """A bare column is allowed when the statement's table is not blocked."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, blocked_columns=["users.email"])
+
+        is_valid, error = validator.validate("SELECT email FROM customers")
+        assert is_valid, error
+
+    def test_qualified_column_unrelated_column_allowed(self) -> None:
+        """Non-blocked columns of a blocked table stay readable."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, blocked_columns=["users.email"])
+
+        is_valid, error = validator.validate("SELECT username FROM users")
+        assert is_valid, error
 
 
 class TestMultiStatement:
@@ -476,30 +529,89 @@ class TestExplainStatements:
         assert is_valid
         assert error is None
 
-    def test_explain_analyze_allowed(self) -> None:
-        """Test EXPLAIN ANALYZE is allowed when EXPLAIN is enabled."""
+    def test_explain_analyze_rejected_even_when_enabled(self) -> None:
+        """Test EXPLAIN ANALYZE is rejected even when EXPLAIN is enabled.
+
+        ANALYZE actually executes the inner statement, so allowing it
+        would bypass the read-only guarantee.
+        """
         config = SecurityConfig()
         validator = SQLValidator(config=config, allow_explain=True)
 
         sql = "EXPLAIN ANALYZE SELECT * FROM users WHERE id > 100"
         is_valid, error = validator.validate(sql)
+        assert not is_valid
+        assert error is not None
+        assert "analyze" in error.lower()
+
+    def test_explain_analyze_in_parens_rejected(self) -> None:
+        """Test ANALYZE inside a parenthesized option list is rejected."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, allow_explain=True)
+
+        sql = "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM users"
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "analyze" in str(exc_info.value).lower()
+
+    def test_explain_with_options_allowed(self) -> None:
+        """Test plan-only EXPLAIN options are accepted and stripped."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, allow_explain=True)
+
+        sql = "EXPLAIN (VERBOSE, COSTS, TIMING OFF, FORMAT JSON) SELECT * FROM users"
+        is_valid, error = validator.validate(sql)
         assert is_valid
         assert error is None
 
-    def test_explain_with_dangerous_query_allowed(self) -> None:
-        """Test EXPLAIN with dangerous underlying query is allowed.
+    def test_explain_with_dangerous_inner_query_rejected(self) -> None:
+        """Test EXPLAIN with a dangerous inner query is rejected.
 
-        EXPLAIN only shows query plans and doesn't execute the query,
-        so even "EXPLAIN DELETE" is safe as it won't modify data.
+        The inner statement is validated with the full pipeline, so
+        "EXPLAIN DELETE" is blocked even though plain EXPLAIN does not
+        execute the statement.
         """
         config = SecurityConfig()
         validator = SQLValidator(config=config, allow_explain=True)
 
-        # EXPLAIN DELETE is safe - it only shows the execution plan
         sql = "EXPLAIN DELETE FROM users"
         is_valid, error = validator.validate(sql)
-        assert is_valid
-        assert error is None
+        assert not is_valid
+        assert error is not None
+
+    def test_explain_with_blocked_table_rejected(self) -> None:
+        """Test blocked tables are enforced on the inner statement."""
+        config = SecurityConfig()
+        validator = SQLValidator(
+            config=config,
+            blocked_tables=["audit_log"],
+            allow_explain=True,
+        )
+
+        sql = "EXPLAIN SELECT * FROM audit_log"
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "audit_log" in str(exc_info.value)
+
+    def test_explain_with_blocked_function_rejected(self) -> None:
+        """Test blocked functions are enforced on the inner statement."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, allow_explain=True)
+
+        sql = "EXPLAIN SELECT pg_sleep(100)"
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "pg_sleep" in str(exc_info.value)
+
+    def test_explain_without_inner_query_fails_closed(self) -> None:
+        """Test EXPLAIN with no extractable inner statement is rejected."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, allow_explain=True)
+
+        sql = "EXPLAIN"
+        is_valid, error = validator.validate(sql)
+        assert not is_valid
+        assert error is not None
 
 
 class TestValidatorHelperMethods:

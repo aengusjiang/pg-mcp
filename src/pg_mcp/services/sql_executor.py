@@ -61,9 +61,10 @@ class SQLExecutor:
         1. Acquires a connection from the pool
         2. Starts a read-only transaction
         3. Sets session parameters (timeout, search_path, role)
-        4. Executes the query with timeout
-        5. Limits the number of returned rows
-        6. Serializes special PostgreSQL types
+        4. Executes the query with the row limit pushed down as a subquery
+           wrapper (fetches at most ``max_rows + 1`` rows instead of the
+           full result set)
+        5. Serializes special PostgreSQL types
 
         Args:
             sql: SQL query to execute (should already be validated).
@@ -73,7 +74,9 @@ class SQLExecutor:
         Returns:
             tuple: (results, total_row_count) where:
                 - results: List of row dictionaries with serialized values
-                - total_row_count: Total number of rows (before limiting)
+                  (at most ``max_rows`` entries)
+                - total_row_count: Number of rows returned by the limited
+                  query; equal to ``max_rows`` when the result was truncated
 
         Raises:
             ExecutionTimeoutError: If query execution exceeds timeout.
@@ -99,10 +102,14 @@ class SQLExecutor:
                 # Set session parameters for security
                 await self._set_session_params(connection, timeout)
 
-                # Execute query with timeout
+                # Execute query with timeout. The row limit is pushed into
+                # SQL so the database stops sending rows beyond max_rows + 1
+                # (the +1 makes truncation detectable without counting
+                # every row).
+                wrapped_sql = self._wrap_with_limit(sql, max_rows)
                 try:
                     records = await asyncio.wait_for(
-                        connection.fetch(sql),
+                        connection.fetch(wrapped_sql),
                         timeout=timeout,
                     )
                 except TimeoutError as e:
@@ -114,12 +121,11 @@ class SQLExecutor:
                         },
                     ) from e
 
-                # Track total count before limiting
-                total_count = len(records)
-
-                # Limit number of returned rows
-                if len(records) > max_rows:
+                truncated = len(records) > max_rows
+                if truncated:
                     records = records[:max_rows]
+
+                total_count = len(records)
 
                 # Convert asyncpg.Record to dict
                 results = [dict(record) for record in records]
@@ -151,6 +157,27 @@ class SQLExecutor:
                     "error_message": str(e),
                 },
             ) from e
+
+    def _wrap_with_limit(self, sql: str, max_rows: int) -> str:
+        """Wrap a validated SELECT with a row-limiting outer query.
+
+        The validator guarantees single-statement SELECT shape, so wrapping
+        is safe. EXPLAIN statements cannot be wrapped in a subquery and are
+        returned unchanged (their inner statement was already validated).
+
+        Args:
+            sql: Validated SQL statement.
+            max_rows: Maximum number of rows to return.
+
+        Returns:
+            SQL that returns at most ``max_rows + 1`` rows.
+        """
+        if sql.lstrip().upper().startswith("EXPLAIN"):
+            return sql
+        inner = sql.strip().rstrip(";")
+        # Safe: `inner` already passed full SQL validation and max_rows is
+        # an internally-sourced integer, so no injection surface exists here.
+        return f"SELECT * FROM ({inner}) AS _limited LIMIT {max_rows + 1}"  # noqa: S608
 
     async def _set_session_params(
         self,

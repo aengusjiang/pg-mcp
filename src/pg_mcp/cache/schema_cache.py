@@ -7,6 +7,7 @@ repeated introspection queries and improve performance.
 import asyncio
 import contextlib
 import logging
+from collections import OrderedDict
 from datetime import UTC, datetime
 
 from asyncpg import Pool
@@ -19,10 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 class SchemaCache:
-    """Schema cache manager with TTL and auto-refresh capabilities.
+    """Schema cache manager with TTL, LRU eviction, and auto-refresh.
 
-    This class manages cached database schemas with configurable TTL and
-    supports automatic background refresh.
+    This class manages cached database schemas with configurable TTL,
+    a ``max_size`` bound (least-recently-used entries are evicted first),
+    and automatic background refresh.
 
     Attributes:
         config: Cache configuration.
@@ -41,13 +43,15 @@ class SchemaCache:
             config: Cache configuration with TTL and size limits.
         """
         self.config = config
-        self._cache: dict[str, DatabaseSchema] = {}
+        self._cache: OrderedDict[str, DatabaseSchema] = OrderedDict()
         self._cache_timestamps: dict[str, datetime] = {}
         self._refresh_task: asyncio.Task[None] | None = None
         self._stop_refresh = False
 
     def get(self, database_name: str) -> DatabaseSchema | None:
         """Get cached schema if available and not expired.
+
+        A successful lookup marks the entry as most recently used.
 
         Args:
             database_name: Name of the database.
@@ -75,6 +79,8 @@ class SchemaCache:
             self._cache_timestamps.pop(database_name, None)
             return None
 
+        # Mark as most recently used
+        self._cache.move_to_end(database_name)
         return self._cache[database_name]
 
     async def load(
@@ -106,9 +112,22 @@ class SchemaCache:
 
         if self.config.enabled:
             self._cache[database_name] = schema
+            self._cache.move_to_end(database_name)
             self._cache_timestamps[database_name] = datetime.now(UTC)
+            self._evict_over_limit()
 
         return schema
+
+    def _evict_over_limit(self) -> None:
+        """Evict least-recently-used entries beyond ``config.max_size``."""
+        while len(self._cache) > self.config.max_size:
+            oldest, _ = self._cache.popitem(last=False)
+            self._cache_timestamps.pop(oldest, None)
+            logger.debug(
+                "Evicted schema cache entry for '%s' (max_size=%d)",
+                oldest,
+                self.config.max_size,
+            )
 
     async def refresh(
         self,
